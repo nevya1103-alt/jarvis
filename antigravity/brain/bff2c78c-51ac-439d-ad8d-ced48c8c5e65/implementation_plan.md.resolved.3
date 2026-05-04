@@ -1,0 +1,44 @@
+# Meme Generator Application (React + Tailwind CSS)
+
+This plan details the creation of a stunning, interactive meme generator web application using React.js and Tailwind CSS, per your latest request.
+
+## User Review Required
+
+> [!IMPORTANT]
+> Since you requested a complete shift to React.js and Tailwind CSS, we will create a brand new project.
+> We will use Vite to scaffold the React project for speed and performance. 
+> The project will be created in a new folder at `C:\Users\NEVYA\.gemini\antigravity\scratch\react-meme-generator`.
+
+## Open Questions
+
+> [!WARNING]
+> 1. **Which version of Tailwind CSS would you like to use?** (Tailwind v3 is the current standard and highly stable, which I recommend, but let me know if you prefer something else).
+> 2. Would you still like to maintain the **"natural colors"** aesthetic (earthy tones, off-whites, soft greens) we discussed earlier, or do you want a completely new color scheme?
+> 3. Should we use an icon library like `lucide-react` to add beautiful, modern icons to our buttons?
+
+## Proposed Changes
+
+We will generate a new Vite + React project and configure Tailwind CSS:
+
+### Foundation
+- Initialize a React project using Vite in `C:\Users\NEVYA\.gemini\antigravity\scratch\react-meme-generator`.
+- Install and configure Tailwind CSS (PostCSS, autoprefixer, and `tailwind.config.js`).
+
+### Components (Built with Tailwind)
+- **Header**: Clean, modern top navigation/title area.
+- **MemeEditor**: The central canvas area displaying the selected template and overlaid text.
+- **ControlsPanel**: A stylish side or bottom panel with input fields for customizing text and buttons to generate new templates or download.
+- **TemplateGallery**: A responsive, auto-fitting grid of popular meme templates fetched from the Imgflip API.
+
+### App Logic
+- Fetch meme templates from the free Imgflip API (`https://api.imgflip.com/get_memes`).
+- Manage state using React hooks (`useState`, `useEffect`).
+- Use the `html-to-image` npm package to capture the meme component and allow users to download it.
+
+## Verification Plan
+
+### Manual Verification
+- Run the local Vite development server (`npm run dev`).
+- Verify the UI looks premium, dynamic, and fully responsive across devices using Tailwind's utility classes.
+- Test text inputs to ensure the meme image updates live.
+- Test the "Download" button to verify it saves a proper image file.

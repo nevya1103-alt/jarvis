@@ -1,0 +1,21 @@
+# Meme Generator Tasks
+
+- [/] Project Setup
+  - [ ] Create project directory (`python-meme-generator`)
+  - [ ] Initialize Python virtual environment
+  - [ ] Install dependencies (`flask`, `requests`, `pillow`)
+- [ ] Backend (Flask)
+  - [ ] Create `app.py`
+  - [ ] Set up route to serve the main page
+  - [ ] Set up API route to fetch memes from Imgflip
+  - [ ] (Optional) Set up route to generate downloadable image
+- [ ] Frontend Structure & Styling
+  - [ ] Create `templates/index.html`
+  - [ ] Create `static/style.css` implementing a "natural color" palette (earthy tones, off-whites, soft greens/browns) with a premium feel
+  - [ ] Build the UI layout (Header, Meme Editor Canvas, Controls, Gallery)
+- [ ] Frontend Logic
+  - [ ] Create `static/script.js`
+  - [ ] Fetch and display templates from the backend
+  - [ ] Handle text inputs and update the meme preview live
+- [ ] Verification
+  - [ ] Run Flask server and test functionality

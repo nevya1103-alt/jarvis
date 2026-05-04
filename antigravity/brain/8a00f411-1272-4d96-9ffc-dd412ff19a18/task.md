@@ -1,0 +1,4 @@
+- `[x]` Update `style.css` with `.light-theme` variables and new animation classes.
+- `[x]` Update `index.html` with Theme Toggle button and JavaScript logic.
+- `[x]` Update `index.html` to replace "Loading..." text with animated gold coins.
+- `[x]` Verify changes and create walkthrough.

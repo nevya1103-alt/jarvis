@@ -1,0 +1,15 @@
+# TMDB Integration Tasks
+
+- [/] Application Logic Updates (`script.js`)
+  - [ ] Remove hardcoded mock `moviesData`.
+  - [ ] Add `TMDB_API_KEY` placeholder.
+  - [ ] Implement `fetchMoviesFromTMDB()` using `/discover/movie` endpoint.
+  - [ ] Configure parameters for Bollywood (Hindi, IN) from 2006 to 2026.
+  - [ ] Map TMDB response to existing `movie-card` UI.
+  - [ ] Implement pagination ("Load More" button) to handle thousands of movies.
+  - [ ] Update search functionality to use TMDB `/search/movie` endpoint.
+  - [ ] Update genre filtering to use TMDB genre IDs.
+- [ ] UI Updates (`index.html`)
+  - [ ] Add a "Load More" button at the bottom of the grid.
+- [ ] Verification
+  - [ ] Ensure the app degrades gracefully or shows a clear error if the API key is missing.

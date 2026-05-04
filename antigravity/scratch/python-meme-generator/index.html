@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nature Meme Generator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="app-container">
+        <header>
+            <h1>Meme Generator</h1>
+            <p>Create your masterpiece</p>
+        </header>
+        
+        <main class="main-content">
+            <div class="editor-section">
+                <div class="meme-container" id="meme-container">
+                    <!-- Default image acts as a placeholder while loading -->
+                    <img id="meme-image" src="" alt="Meme Template" style="display: none;">
+                    <div class="loading-state" id="loading-state">Loading template...</div>
+                    <div class="meme-text top" id="display-top-text"></div>
+                    <div class="meme-text bottom" id="display-bottom-text"></div>
+                </div>
+            </div>
+            
+            <div class="controls-section">
+                <div class="glass-panel">
+                    <h2>Customize</h2>
+                    <div class="input-group">
+                        <label for="top-text-input">Top Text</label>
+                        <input type="text" id="top-text-input" placeholder="Enter top text...">
+                    </div>
+                    <div class="input-group">
+                        <label for="bottom-text-input">Bottom Text</label>
+                        <input type="text" id="bottom-text-input" placeholder="Enter bottom text...">
+                    </div>
+                    <div class="button-group">
+                        <button id="random-btn" class="btn btn-primary">Random Template</button>
+                        <button id="download-btn" class="btn btn-secondary">Download Meme</button>
+                    </div>
+                </div>
+            </div>
+        </main>
+        
+        <section class="gallery-section">
+            <h2>Popular Templates</h2>
+            <div class="template-gallery" id="template-gallery">
+                <!-- Templates will be injected here via JavaScript -->
+            </div>
+        </section>
+    </div>
+
+    <!-- html2canvas for downloading the meme -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>

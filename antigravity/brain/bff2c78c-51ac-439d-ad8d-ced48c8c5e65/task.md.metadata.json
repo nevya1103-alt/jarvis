@@ -1,0 +1,6 @@
+{
+  "artifactType":  "ARTIFACT_TYPE_TASK",
+  "summary":  "Task list for integrating TMDB API to fetch Bollywood movies.",
+  "updatedAt":  "2026-05-04T08:21:50.960534700Z",
+  "version":  "5"
+}
