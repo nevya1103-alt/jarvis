@@ -1,5 +1,14 @@
+
 import os
 import pygame
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
 import speech_recognition as sr
 from gtts import gTTS
 import tkinter as tk
@@ -7,6 +16,28 @@ from tkinter import scrolledtext
 import threading
 import time
 from datetime import datetime
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+try:
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+except ImportError:
+    AudioUtilities = None
+    IAudioEndpointVolume = None
+    CLSCTX_ALL = None
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv()
+load_dotenv(os.path.join(PROJECT_DIR, ".env"))
 
 # Initialize pygame mixer for playing audio
 try:
@@ -80,10 +111,251 @@ LANGUAGE_PACK['gu'] = {
 current_language = 'en'
 is_sleeping = False
 last_microphone_error = ""
+last_microphone_level = ""
+selected_microphone_index = None
+ai_client = None
+AI_MODEL = os.getenv("JARVIS_AI_MODEL", "gpt-5.4-mini")
+AI_SYSTEM_PROMPT = (
+    "You are Jarvis, a warm robot-cat desktop assistant. "
+    "Answer clearly, briefly, and helpfully. Keep replies friendly and easy to speak aloud. "
+    "When the user asks for code, steps, facts, or ideas, answer directly without saying you are still learning."
+)
+AI_HISTORY = []
+AI_HISTORY_LIMIT = 8
+last_microphone_volume_fix = ""
+
+def ensure_default_microphone_volume():
+    """Unmute and raise the default Windows microphone endpoint when pycaw is available."""
+    global last_microphone_volume_fix
+    last_microphone_volume_fix = ""
+    if AudioUtilities is None or IAudioEndpointVolume is None:
+        return False
+
+    try:
+        microphone = AudioUtilities.GetMicrophone()
+        endpoint = microphone.Activate(
+            IAudioEndpointVolume._iid_,
+            CLSCTX_ALL,
+            None,
+        ).QueryInterface(IAudioEndpointVolume)
+
+        was_muted = bool(endpoint.GetMute())
+        old_volume = float(endpoint.GetMasterVolumeLevelScalar())
+        changed = False
+        if was_muted:
+            endpoint.SetMute(0, None)
+            changed = True
+        if old_volume < 0.8:
+            endpoint.SetMasterVolumeLevelScalar(1.0, None)
+            changed = True
+
+        new_volume = float(endpoint.GetMasterVolumeLevelScalar())
+        is_muted = bool(endpoint.GetMute())
+        last_microphone_volume_fix = (
+            f"default mic volume {old_volume:.0%}->{new_volume:.0%}, "
+            f"mute {was_muted}->{is_muted}"
+        )
+        return changed
+    except Exception as e:
+        last_microphone_volume_fix = f"Could not adjust default microphone volume: {e}"
+        return False
+
+def get_microphone_devices():
+    """Return usable input devices from PyAudio when available, otherwise sounddevice."""
+    if pyaudio is not None:
+        audio = pyaudio.PyAudio()
+        try:
+            devices = []
+            for idx in range(audio.get_device_count()):
+                info = audio.get_device_info_by_index(idx)
+                input_channels = int(info.get("maxInputChannels", 0))
+                devices.append((idx, info.get("name", f"Device {idx}"), input_channels))
+            return devices
+        finally:
+            audio.terminate()
+
+    if sd is not None:
+        return [
+            (idx, device["name"], int(device["max_input_channels"]))
+            for idx, device in enumerate(sd.query_devices())
+        ]
+
+    raise RuntimeError("No microphone backend available. Install sounddevice or PyAudio.")
+
+def is_real_microphone_name(name):
+    """Filter out loopback and output-like devices that report input channels."""
+    name_lower = name.lower()
+    blocked = ["output", "speaker", "headphone", "pc speaker", "sound mapper - output", "stereo mix"]
+    return not any(keyword in name_lower for keyword in blocked)
+
+def get_sounddevice_hostapi_name(device_info):
+    """Return the host API name for a sounddevice device info dict."""
+    if sd is None:
+        return ""
+    try:
+        return sd.query_hostapis(int(device_info["hostapi"]))["name"]
+    except Exception:
+        return ""
+
+def is_preferred_sounddevice_input(device_info):
+    """Prefer normal Windows shared inputs over raw WDM-KS pins."""
+    return get_sounddevice_hostapi_name(device_info) != "Windows WDM-KS"
+
+def get_sounddevice_input_candidates(device_index=None, device_name=None):
+    """Build an ordered list of sounddevice input devices to try."""
+    if sd is None:
+        return []
+
+    devices = list(enumerate(sd.query_devices()))
+    candidates = []
+
+    def add_if_input(idx, allow_wdmks=False):
+        try:
+            info = sd.query_devices(idx)
+        except Exception:
+            return
+        if int(info["max_input_channels"]) <= 0:
+            return
+        if not allow_wdmks and not is_preferred_sounddevice_input(info):
+            return
+        item = (idx, info)
+        if item not in candidates:
+            candidates.append(item)
+
+    for hostapi in sd.query_hostapis():
+        host_name = hostapi.get("name", "")
+        if host_name == "Windows WDM-KS":
+            continue
+        default_idx = int(hostapi.get("default_input_device", -1))
+        if default_idx >= 0:
+            add_if_input(default_idx)
+
+    if device_name:
+        target = " ".join(device_name.lower().split())
+        for idx, info in devices:
+            name = " ".join(info["name"].lower().split())
+            if target and (target in name or name in target):
+                add_if_input(idx)
+
+    if device_index is not None:
+        add_if_input(device_index)
+
+    for idx, info in devices:
+        if int(info["max_input_channels"]) > 0 and is_real_microphone_name(info["name"]) and is_preferred_sounddevice_input(info):
+            add_if_input(idx)
+
+    if device_index is not None:
+        add_if_input(device_index, allow_wdmks=True)
+
+    return candidates
+
+def get_supported_sounddevice_settings(device_index):
+    """Find recording settings accepted by the current Windows audio driver."""
+    info = sd.query_devices(device_index)
+    default_rate = int(info.get("default_samplerate") or 0)
+    sample_rates = []
+    for rate in (default_rate, 48000, 44100, 16000, 8000):
+        if rate > 0 and rate not in sample_rates:
+            sample_rates.append(rate)
+
+    max_channels = int(info["max_input_channels"])
+    channels_to_try = [1]
+    if max_channels >= 2:
+        channels_to_try.append(2)
+
+    errors = []
+    for samplerate in sample_rates:
+        for channels in channels_to_try:
+            try:
+                sd.check_input_settings(
+                    device=device_index,
+                    channels=channels,
+                    samplerate=samplerate,
+                    dtype="int16",
+                )
+                return samplerate, channels
+            except Exception as e:
+                errors.append(f"{samplerate}Hz/{channels}ch: {e}")
+
+    raise RuntimeError("; ".join(errors[-4:]))
+
+def get_recognition_language():
+    """Map Jarvis UI language to Google speech-recognition locale."""
+    return {
+        "en": "en-IN",
+        "hi": "hi-IN",
+        "gu": "gu-IN",
+    }.get(current_language, "en-IN")
+
+def describe_recorded_level(frames):
+    """Return simple signal numbers for the recorded int16 audio."""
+    peak = int(abs(frames).max())
+    rms = float((frames.astype("float64") ** 2).mean() ** 0.5)
+    return peak, rms
+
+def normalize_recorded_audio(frames, peak):
+    """Boost quiet non-silent input before speech recognition."""
+    if peak <= 0:
+        return frames
+    target_peak = 18000
+    if peak >= target_peak:
+        return frames
+    scale = min(target_peak / peak, 50)
+    boosted = frames.astype("float64") * scale
+    return boosted.clip(-32768, 32767).astype("int16")
 
 def get_text(key):
     """Get localized text for given key."""
     return LANGUAGE_PACK.get(current_language, LANGUAGE_PACK['en']).get(key, "")
+
+def get_ai_client():
+    """Create the OpenAI client only when an API key is available."""
+    global ai_client
+    if OpenAI is None:
+        return None
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    if ai_client is None:
+        ai_client = OpenAI()
+    return ai_client
+
+def ask_ai(user_input):
+    """Ask the AI model for a Jarvis response."""
+    global AI_HISTORY
+    if OpenAI is None:
+        return "AI is connected in the code, but the OpenAI package is not installed yet."
+
+    client = get_ai_client()
+    if client is None:
+        return "AI is ready, but OPENAI_API_KEY is not set. Add your API key, restart Jarvis, and ask me again."
+
+    try:
+        conversation = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+        conversation.extend(AI_HISTORY[-AI_HISTORY_LIMIT:])
+        conversation.append({"role": "user", "content": user_input})
+
+        response = client.responses.create(
+            model=AI_MODEL,
+            input=conversation,
+            max_output_tokens=220,
+        )
+        answer = response.output_text.strip()
+        AI_HISTORY.extend([
+            {"role": "user", "content": user_input},
+            {"role": "assistant", "content": answer},
+        ])
+        AI_HISTORY = AI_HISTORY[-AI_HISTORY_LIMIT:]
+        return answer
+    except Exception as e:
+        error_text = str(e)
+        if "insufficient_quota" in error_text or "exceeded your current quota" in error_text:
+            return (
+                "AI is connected, but this OpenAI API key has no available quota. "
+                "Check billing/quota on the OpenAI platform or use another API key."
+            )
+        if "Connection error" in error_text:
+            return "AI is connected in Jarvis, but the network request failed. Check your internet connection and try again."
+        return f"AI error: {e}"
 
 def speak(text, lang=None):
     """Converts text to speech using Google TTS and plays it."""
@@ -108,29 +380,118 @@ def speak(text, lang=None):
     except Exception as e:
         print(f"(Audio error: {e})")
 
-def listen():
+def listen(device_index=None, device_name="Windows default input"):
     """Captures voice input from the microphone and returns it as text."""
-    global last_microphone_error
+    global last_microphone_error, last_microphone_level
     last_microphone_error = ""
+    last_microphone_level = ""
     recognizer = sr.Recognizer()
+    recognizer.dynamic_energy_threshold = True
+    recognizer.energy_threshold = 300
+    recognizer.pause_threshold = 0.8
 
     def listen_from_source(source, device_name):
         print(f"[INFO] Using microphone: {device_name}")
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-        print("[INFO] Listening for speech (7 seconds timeout)...")
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        print("[INFO] Listening for speech (12 seconds timeout)...")
         print("[TIP] Speak clearly and wait for processing...")
-        audio = recognizer.listen(source, timeout=7, phrase_time_limit=10)
+        audio = recognizer.listen(source, timeout=12, phrase_time_limit=10)
         print("[INFO] Processing audio...")
-        text = recognizer.recognize_google(audio)
+        text = recognizer.recognize_google(audio, language=get_recognition_language())
         print(f"[SUCCESS] Recognized: {text}")
         return text
 
+    def listen_with_sounddevice(device_index, device_name):
+        global last_microphone_error, last_microphone_level
+        if sd is None:
+            raise RuntimeError("Sounddevice is not installed")
+        ensure_default_microphone_volume()
+        errors = []
+        for candidate_index, info in get_sounddevice_input_candidates(device_index, device_name):
+            candidate_name = info["name"]
+            try:
+                samplerate, channels = get_supported_sounddevice_settings(candidate_index)
+                print(f"[INFO] Using sounddevice microphone {candidate_index}: {candidate_name}")
+                print(f"[INFO] Recording at {samplerate} Hz, {channels} channel(s)")
+                frames = sd.rec(
+                    int(12 * samplerate),
+                    samplerate=samplerate,
+                    channels=channels,
+                    dtype='int16',
+                    device=candidate_index,
+                )
+                sd.wait()
+                peak, rms = describe_recorded_level(frames)
+                last_microphone_level = f"{candidate_name}: peak {peak}, rms {rms:.1f}"
+                print(f"[INFO] Mic signal level: {last_microphone_level}")
+                if peak <= 3 and rms < 1:
+                    message = (
+                        f"{candidate_index} ({candidate_name}): very low input "
+                        f"(peak {peak}, rms {rms:.1f})"
+                    )
+                    errors.append(message)
+                    print(f"[WARN] Skipping silent input: {message}")
+                    try:
+                        sd.stop()
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    continue
+
+                frames = normalize_recorded_audio(frames, peak)
+                raw_data = frames.tobytes()
+                audio_data = sr.AudioData(raw_data, samplerate, 2)
+                text = recognizer.recognize_google(audio_data, language=get_recognition_language())
+                print(f"[SUCCESS] Recognized: {text}")
+                return text
+            except (sr.UnknownValueError, sr.RequestError):
+                raise
+            except Exception as e:
+                message = f"{candidate_index} ({candidate_name}): {e}"
+                errors.append(message)
+                print(f"[WARN] Sounddevice input failed: {message}")
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+        if errors:
+            last_microphone_error = "Tried sounddevice inputs:\n" + "\n".join(errors[-6:])
+            if any("very low input" in error for error in errors):
+                return "SILENCE"
+            raise RuntimeError("Tried sounddevice inputs:\n" + "\n".join(errors[-6:]))
+        raise RuntimeError("No sounddevice input microphones are available")
+
     def listen_from_device(device_index, device_name):
+        if pyaudio is None:
+            return listen_with_sounddevice(device_index, device_name)
+
         mic = None
+        audio = None
         try:
             mic = sr.Microphone(device_index=device_index)
-            source = mic.__enter__()
-            return listen_from_source(source, device_name)
+            if device_index is not None:
+                probe = pyaudio.PyAudio()
+                try:
+                    info = probe.get_device_info_by_index(device_index)
+                    if int(info.get("maxInputChannels", 0)) <= 0:
+                        raise OSError(f"{device_name} is not an input microphone")
+                finally:
+                    probe.terminate()
+
+            audio = mic.pyaudio_module.PyAudio()
+            stream = audio.open(
+                input_device_index=mic.device_index,
+                channels=1,
+                format=mic.format,
+                rate=mic.SAMPLE_RATE,
+                frames_per_buffer=mic.CHUNK,
+                input=True,
+            )
+            mic.audio = audio
+            mic.stream = sr.Microphone.MicrophoneStream(stream)
+            return listen_from_source(mic, device_name)
         finally:
             if mic is not None:
                 try:
@@ -145,6 +506,25 @@ def listen():
                     mic.audio = None
                 except Exception as cleanup_error:
                     print(f"[WARN] Microphone cleanup skipped: {cleanup_error}")
+            elif audio is not None:
+                audio.terminate()
+
+    if device_index is not None:
+        try:
+            return listen_from_device(device_index, device_name)
+        except sr.WaitTimeoutError:
+            print("[ERROR] No speech detected within timeout period")
+            return "TIMEOUT"
+        except sr.UnknownValueError:
+            print("[ERROR] Could not understand the audio")
+            return "UNKNOWN"
+        except sr.RequestError as e:
+            print(f"[ERROR] Google API request failed: {e}")
+            return "API_ERROR"
+        except Exception as e:
+            last_microphone_error = f"{device_name}: {e}"
+            print(f"[ERROR] Selected microphone failed: {e}")
+            return "MIC_ERROR"
 
     try:
         print("[INFO] Trying Windows default microphone...")
@@ -164,25 +544,26 @@ def listen():
 
     try:
         print("[INFO] Scanning for available microphones...")
-        mic_names = sr.Microphone.list_microphone_names()
-        print(f"[INFO] Found {len(mic_names)} audio devices")
+        devices = get_microphone_devices()
+        print(f"[INFO] Found {len(devices)} audio devices")
 
-        if not mic_names:
-            last_microphone_error = "No audio input devices were returned by PyAudio."
+        if not devices:
+            last_microphone_error = "No audio devices were returned by the microphone backend."
             print("[ERROR] No audio devices found!")
             return "MIC_ERROR"
 
-        for idx, name in enumerate(mic_names):
-            print(f"[INFO] Audio Device {idx}: {name}")
+        for idx, name, input_channels in devices:
+            print(f"[INFO] Audio Device {idx}: {name} ({input_channels} input channels)")
 
-        exclude_keywords = ["output", "speaker", "headphone", "sound mapper - output"]
         priority_keywords = ["microphone", "mic", "array", "input", "realtek", "headset", "webcam", "camera"]
 
         priority_devices = []
         fallback_devices = []
-        for idx, name in enumerate(mic_names):
+        for idx, name, input_channels in devices:
+            if input_channels <= 0:
+                continue
             name_lower = name.lower()
-            if any(keyword in name_lower for keyword in exclude_keywords):
+            if not is_real_microphone_name(name):
                 continue
             if any(keyword in name_lower for keyword in priority_keywords):
                 priority_devices.append((idx, name))
@@ -191,7 +572,7 @@ def listen():
 
         devices_to_try = priority_devices + fallback_devices
         if not devices_to_try:
-            devices_to_try = list(enumerate(mic_names))
+            devices_to_try = [(idx, name) for idx, name, input_channels in devices if input_channels > 0]
 
         errors = []
         for device_idx, device_name in devices_to_try:
@@ -221,10 +602,16 @@ def listen():
 # ============================================================================
 # PHASE 5: COMMAND HANDLING
 # ============================================================================
+def is_simple_greeting(user_input):
+    """Detect greetings that should stay as quick local replies."""
+    cleaned = user_input.strip().lower().replace(",", "").replace("!", "").replace(".", "")
+    return cleaned in {"hello", "hi", "hey", "hello jarvis", "hi jarvis", "hey jarvis"}
+
 def handle_command(user_input):
     """Handle specific commands from user input."""
     global is_sleeping, current_language
-    user_input = user_input.lower()
+    original_input = user_input.strip()
+    user_input = original_input.lower()
     
     # Sleep command
     if "sleep" in user_input:
@@ -252,7 +639,7 @@ def handle_command(user_input):
         return "Language changed to English.", False
     
     # Standard responses
-    if "hello" in user_input or "hi" in user_input:
+    if is_simple_greeting(original_input):
         return get_text('hello'), False
     elif "how are you" in user_input:
         return get_text('how_are_you'), False
@@ -261,7 +648,7 @@ def handle_command(user_input):
     elif "bye" in user_input or "exit" in user_input or "quit" in user_input:
         return get_text('goodbye'), True
     else:
-        return get_text('unknown'), False
+        return ask_ai(original_input), False
 
 # ============================================================================
 # PHASE 6: GUI DEVELOPMENT
@@ -334,7 +721,8 @@ class JarvisGUI:
         )
         send_btn.pack(side=tk.LEFT, padx=5)
         
-        voice_btn = tk.Button(
+        self.is_listening = False
+        self.voice_btn = tk.Button(
             button_frame,
             text="Voice Input",
             command=self.on_voice_input,
@@ -342,7 +730,30 @@ class JarvisGUI:
             fg='#101112',
             font=("Helvetica", 10, "bold")
         )
-        voice_btn.pack(side=tk.LEFT, padx=5)
+        self.voice_btn.pack(side=tk.LEFT, padx=5)
+
+        self.microphone_choices = {"Default microphone": (None, "Windows default input")}
+        self.microphone_var = tk.StringVar(value="Default microphone")
+        self.microphone_menu = tk.OptionMenu(button_frame, self.microphone_var, "Default microphone")
+        self.microphone_menu.configure(
+            bg='#161515',
+            fg='#e8f7fb',
+            activebackground='#2a2827',
+            activeforeground='#8ee8ff',
+            highlightthickness=0,
+            font=("Helvetica", 9)
+        )
+        self.microphone_menu.pack(side=tk.LEFT, padx=5)
+
+        refresh_mic_btn = tk.Button(
+            button_frame,
+            text="Refresh Mics",
+            command=self.refresh_microphone_list,
+            bg='#2a2827',
+            fg='#8ee8ff',
+            font=("Helvetica", 10, "bold")
+        )
+        refresh_mic_btn.pack(side=tk.LEFT, padx=5)
         
         language_btn = tk.Button(
             button_frame,
@@ -366,6 +777,10 @@ class JarvisGUI:
         
         self.animation_frame = 0
         self.add_to_display("[SYSTEM] Jarvis Assistant initialized. All phases active!")
+        if ensure_default_microphone_volume() and last_microphone_volume_fix:
+            self.add_to_display(f"[FIX] Microphone was muted/low. Adjusted {last_microphone_volume_fix}.")
+        self.add_to_display("[INFO] Refreshing microphone list on startup...")
+        self.refresh_microphone_list(show_messages=True)
         self.show_idle_face()
     
     def add_to_display(self, message):
@@ -406,14 +821,21 @@ class JarvisGUI:
     
     def on_voice_input(self):
         """Handle voice input."""
-        self.add_to_display("[LISTENING] Speak now... (7 seconds timeout)")
-        self.add_to_display("[INFO] Make sure your microphone is connected and working!")
+        if self.is_listening:
+            self.add_to_display("[INFO] Already listening. Wait for the current voice input to finish.")
+            return
+
+        self.is_listening = True
+        self.voice_btn.configure(state=tk.DISABLED, text="Listening...")
+        self.add_to_display("[LISTENING] Speak now... (12 seconds timeout)")
+        self.add_to_display("[INFO] Keep speaking while Jarvis checks available microphone inputs.")
         threading.Thread(target=self._process_voice, daemon=True).start()
     
     def _process_voice(self):
         """Process voice input in background thread."""
         try:
-            user_input = listen()
+            selected_mic = self.microphone_choices.get(self.microphone_var.get(), (None, "Windows default input"))
+            user_input = listen(*selected_mic)
             
             # Handle error codes
             if user_input == "TIMEOUT":
@@ -421,6 +843,15 @@ class JarvisGUI:
                 return
             elif user_input == "UNKNOWN":
                 self.add_to_display("[ERROR] Could not understand audio. Please speak clearly and try again.")
+                if last_microphone_level:
+                    self.add_to_display(f"[DETAIL] Mic signal: {last_microphone_level}")
+                self.add_to_display("[TIP] Say a short phrase like 'hello Jarvis' while the button says Listening.")
+                return
+            elif user_input == "SILENCE":
+                self.add_to_display("[ERROR] Jarvis recorded silence or very low microphone volume.")
+                if last_microphone_error:
+                    self.add_to_display(f"[DETAIL] {last_microphone_error}")
+                self.add_to_display("[FIX] Windows is not exposing a working recording endpoint. Enable a Microphone in Sound > Recording, set it as Default, and raise its Levels volume.")
                 return
             elif user_input == "API_ERROR":
                 self.add_to_display("[ERROR] Google API error. Check your internet connection.")
@@ -429,6 +860,9 @@ class JarvisGUI:
                 self.add_to_display("[ERROR] Microphone not found or not working. Check your audio device.")
                 if last_microphone_error:
                     self.add_to_display(f"[DETAIL] {last_microphone_error}")
+                    if "-9999" in last_microphone_error or "Unanticipated host error" in last_microphone_error:
+                        self.add_to_display("[FIX] Windows is blocking or failing to open the mic stream.")
+                        self.add_to_display("[FIX] Enable microphone access for desktop apps, close other mic apps, then try mic 7 or 5.")
                 return
             elif not user_input:
                 self.add_to_display("[ERROR] Voice input failed. Try typing instead.")
@@ -443,6 +877,69 @@ class JarvisGUI:
                 self.root.after(1000, self.root.quit)
         except Exception as e:
             self.add_to_display(f"[ERROR] Unexpected error: {e}")
+        finally:
+            self.root.after(0, self._finish_voice_input)
+
+    def _finish_voice_input(self):
+        """Re-enable voice controls after the recorder finishes."""
+        self.is_listening = False
+        self.voice_btn.configure(state=tk.NORMAL, text="Voice Input")
+
+    def refresh_microphone_list(self, show_messages=True):
+        """Refresh available microphone devices in the dropdown."""
+        try:
+            devices = get_microphone_devices()
+        except Exception as e:
+            if show_messages:
+                self.add_to_display(f"[ERROR] Could not list microphones: {e}")
+            return
+
+        self.microphone_choices = {"Default microphone": (None, "Windows default input")}
+        input_count = 0
+        for idx, name, input_channels in devices:
+            if input_channels <= 0:
+                continue
+
+            if not is_real_microphone_name(name):
+                continue
+
+            if sd is not None and pyaudio is None:
+                try:
+                    device_info = sd.query_devices(idx)
+                    if not is_preferred_sounddevice_input(device_info):
+                        continue
+                    hostapi_name = get_sounddevice_hostapi_name(device_info)
+                except Exception:
+                    hostapi_name = ""
+            else:
+                hostapi_name = ""
+
+            backend_label = f", {hostapi_name}" if hostapi_name else ""
+            label = f"{idx}: {name} ({input_channels} input channel{'s' if input_channels != 1 else ''}{backend_label})"
+            self.microphone_choices[label] = (idx, name)
+            input_count += 1
+
+        menu = self.microphone_menu["menu"]
+        menu.delete(0, "end")
+        for label in self.microphone_choices:
+            menu.add_command(label=label, command=lambda value=label: self.microphone_var.set(value))
+
+        current = self.microphone_var.get()
+        if current not in self.microphone_choices:
+            preferred = next(
+                (label for label in self.microphone_choices if "Microphone Array" in label),
+                next((label for label in self.microphone_choices if "Microphone" in label), "Default microphone")
+            )
+            self.microphone_var.set(preferred)
+
+        if show_messages:
+            backend = "PyAudio" if pyaudio is not None else "sounddevice"
+            self.add_to_display(f"[INFO] Found {len(devices)} audio devices via {backend}, {input_count} usable microphone inputs.")
+            if input_count > 0:
+                self.add_to_display("[INFO] Available microphones:")
+                for label in self.microphone_choices:
+                    self.add_to_display(f"  {label}")
+            self.add_to_display(f"[INFO] Selected mic: {self.microphone_var.get()}")
     
     def show_language_menu(self):
         """Show language selection menu."""

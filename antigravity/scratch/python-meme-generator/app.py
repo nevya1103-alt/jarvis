@@ -1,7 +1,7 @@
 from flask import Flask, render_template, jsonify
 import requests
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='.', static_folder='.', static_url_path='')
 
 IMGFLIP_API_URL = "https://api.imgflip.com/get_memes"
 

@@ -3,6 +3,14 @@ import pygame
 import speech_recognition as sr
 from gtts import gTTS
 import time
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
 
 # Initialize pygame mixer for playing audio
 try:
@@ -49,6 +57,124 @@ LANGUAGE_PACK = {
 current_language = 'en'
 is_sleeping = False
 
+def get_microphone_devices():
+    """Return usable input devices from PyAudio when available, otherwise sounddevice."""
+    if pyaudio is not None:
+        audio = pyaudio.PyAudio()
+        try:
+            devices = []
+            for idx in range(audio.get_device_count()):
+                info = audio.get_device_info_by_index(idx)
+                devices.append((idx, info.get("name", f"Device {idx}"), int(info.get("maxInputChannels", 0))))
+            return devices
+        finally:
+            audio.terminate()
+
+    if sd is not None:
+        return [
+            (idx, device["name"], int(device["max_input_channels"]))
+            for idx, device in enumerate(sd.query_devices())
+        ]
+
+    raise RuntimeError("No microphone backend available. Install sounddevice or PyAudio.")
+
+def is_real_microphone_name(name):
+    """Filter out loopback and output-like devices that report input channels."""
+    name_lower = name.lower()
+    blocked = ["output", "speaker", "speakers", "headphone", "pc speaker", "sound mapper", "stereo mix"]
+    return not any(keyword in name_lower for keyword in blocked)
+
+def get_sounddevice_hostapi_name(device_info):
+    """Return the host API name for a sounddevice device info dict."""
+    if sd is None:
+        return ""
+    try:
+        return sd.query_hostapis(int(device_info["hostapi"]))["name"]
+    except Exception:
+        return ""
+
+def is_preferred_sounddevice_input(device_info):
+    """Prefer normal Windows shared inputs over raw WDM-KS pins."""
+    return get_sounddevice_hostapi_name(device_info) != "Windows WDM-KS"
+
+def get_sounddevice_input_candidates(device_index=None, device_name=None):
+    """Build an ordered list of sounddevice input devices to try."""
+    if sd is None:
+        return []
+
+    devices = list(enumerate(sd.query_devices()))
+    candidates = []
+
+    def add_if_input(idx, allow_wdmks=False):
+        try:
+            info = sd.query_devices(idx)
+        except Exception:
+            return
+        if int(info["max_input_channels"]) <= 0:
+            return
+        if not allow_wdmks and not is_preferred_sounddevice_input(info):
+            return
+        item = (idx, info)
+        if item not in candidates:
+            candidates.append(item)
+
+    for hostapi in sd.query_hostapis():
+        host_name = hostapi.get("name", "")
+        if host_name == "Windows WDM-KS":
+            continue
+        default_idx = int(hostapi.get("default_input_device", -1))
+        if default_idx >= 0:
+            add_if_input(default_idx)
+
+    if device_name:
+        target = " ".join(device_name.lower().split())
+        for idx, info in devices:
+            name = " ".join(info["name"].lower().split())
+            if target and (target in name or name in target):
+                add_if_input(idx)
+
+    if device_index is not None:
+        add_if_input(device_index)
+
+    for idx, info in devices:
+        if int(info["max_input_channels"]) > 0 and is_real_microphone_name(info["name"]) and is_preferred_sounddevice_input(info):
+            add_if_input(idx)
+
+    if device_index is not None:
+        add_if_input(device_index, allow_wdmks=True)
+
+    return candidates
+
+def get_supported_sounddevice_settings(device_index):
+    """Find recording settings accepted by the current Windows audio driver."""
+    info = sd.query_devices(device_index)
+    default_rate = int(info.get("default_samplerate") or 0)
+    sample_rates = []
+    for rate in (default_rate, 48000, 44100, 16000, 8000):
+        if rate > 0 and rate not in sample_rates:
+            sample_rates.append(rate)
+
+    max_channels = int(info["max_input_channels"])
+    channels_to_try = [1]
+    if max_channels >= 2:
+        channels_to_try.append(2)
+
+    errors = []
+    for samplerate in sample_rates:
+        for channels in channels_to_try:
+            try:
+                sd.check_input_settings(
+                    device=device_index,
+                    channels=channels,
+                    samplerate=samplerate,
+                    dtype="int16",
+                )
+                return samplerate, channels
+            except Exception as e:
+                errors.append(f"{samplerate}Hz/{channels}ch: {e}")
+
+    raise RuntimeError("; ".join(errors[-4:]))
+
 def get_text(key):
     """Get localized text for given key."""
     return LANGUAGE_PACK.get(current_language, LANGUAGE_PACK['en']).get(key, "")
@@ -79,22 +205,77 @@ def speak(text, lang=None):
 def listen():
     """Captures voice input from the microphone and returns it as text."""
     recognizer = sr.Recognizer()
+
+    def listen_with_sounddevice(device_idx, device_name):
+        if sd is None:
+            raise RuntimeError("sounddevice is not installed")
+        errors = []
+        for candidate_idx, info in get_sounddevice_input_candidates(device_idx, device_name):
+            candidate_name = info["name"]
+            try:
+                samplerate, channels = get_supported_sounddevice_settings(candidate_idx)
+                print(f"[INFO] Using sounddevice microphone {candidate_idx}: {candidate_name}")
+                print(f"[LISTENING] Recording for 7 seconds at {samplerate} Hz")
+                frames = sd.rec(
+                    int(7 * samplerate),
+                    samplerate=samplerate,
+                    channels=channels,
+                    dtype="int16",
+                    device=candidate_idx,
+                )
+                sd.wait()
+                peak = int(abs(frames).max())
+                rms = float((frames.astype("float64") ** 2).mean() ** 0.5)
+                if peak <= 3 and rms < 1:
+                    message = f"{candidate_idx} ({candidate_name}): very low input (peak {peak}, rms {rms:.1f})"
+                    errors.append(message)
+                    print(f"[WARN] Skipping silent input: {message}")
+                    try:
+                        sd.stop()
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    continue
+
+                if 0 < peak < 18000:
+                    scale = min(18000 / peak, 50)
+                    frames = (frames.astype("float64") * scale).clip(-32768, 32767).astype("int16")
+
+                audio = sr.AudioData(frames.tobytes(), samplerate, 2)
+                print("[INFO] Processing audio...")
+                return recognizer.recognize_google(audio)
+            except (sr.UnknownValueError, sr.RequestError):
+                raise
+            except Exception as e:
+                message = f"{candidate_idx} ({candidate_name}): {e}"
+                errors.append(message)
+                print(f"[WARN] Sounddevice input failed: {message}")
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+        if errors:
+            raise RuntimeError("Tried sounddevice inputs:\n" + "\n".join(errors[-6:]))
+        raise RuntimeError("No sounddevice input microphones are available")
+
     try:
         print("\n🎤 [INFO] Scanning for available microphones...")
         
         # Find available input microphones
-        mic_names = sr.Microphone.list_microphone_names()
-        print(f"🎤 [INFO] Found {len(mic_names)} audio devices")
+        devices = get_microphone_devices()
+        print(f"🎤 [INFO] Found {len(devices)} audio devices")
         
         # Look for input devices
         input_devices = []
-        exclude_keywords = ["output", "speakers", "pc speaker", "headphones", "sound mapper"]
-        
-        for idx, name in enumerate(mic_names):
+        for idx, name, input_channels in devices:
+            if input_channels <= 0:
+                continue
             name_lower = name.lower()
             if "microphone" in name_lower or "mic" in name_lower:
                 # Exclude output devices
-                if not any(keyword in name_lower for keyword in exclude_keywords):
+                if is_real_microphone_name(name):
                     input_devices.append((idx, name))
                     print(f"🎤 [INFO] Input Device {idx}: {name}")
         
@@ -109,6 +290,9 @@ def listen():
         print("🎤 [INFO] Microphone ready. Adjusting for ambient noise...")
         
         try:
+            if pyaudio is None:
+                return listen_with_sounddevice(device_idx, device_name)
+
             with sr.Microphone(device_index=device_idx) as source:
                 recognizer.adjust_for_ambient_noise(source, duration=1)
                 print("🎤 [LISTENING] Speak now... (7 seconds timeout)")

@@ -1,0 +1,9 @@
+flask
+gTTS
+openai
+pycaw
+pygame-ce
+python-dotenv
+requests
+sounddevice
+SpeechRecognition
